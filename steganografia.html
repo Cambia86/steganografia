@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<title>Steganografia immagine-in-immagine</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 1000px; margin: 2rem auto; padding: 0 1rem; }
+  .row { display: flex; gap: 1rem; flex-wrap: wrap; margin: 1rem 0; align-items: end; }
+  figure { margin: 0; } canvas { max-width: 300px; border: 1px solid #ccc; display: block; }
+  figcaption { font-size: .85rem; color: #555; }
+</style>
+</head>
+<body>
+<h1>Nascondi un'immagine dentro un'altra</h1>
+<div class="row">
+  <label>Cover <input type="file" id="cover" accept="image/*"></label>
+  <label>Segreta <input type="file" id="secret" accept="image/*"></label>
+  <label>Bit <input type="number" id="bits" value="4" min="1" max="7" style="width:3rem"></label>
+  <label>Chiave <input type="text" id="key" placeholder="opzionale"></label>
+  <button id="go">Nascondi</button>
+</div>
+<div class="row">
+  <label>Oppure estrai da una stego PNG <input type="file" id="stegoIn" accept="image/png"></label>
+  <button id="ex">Estrai</button>
+</div>
+<p id="status" style="font-weight:600"></p>
+<p id="info"></p>
+<div class="row">
+  <figure><canvas id="cCover"></canvas><figcaption>Cover</figcaption></figure>
+  <figure><canvas id="cStego"></canvas><figcaption>Stego (<a id="dl" download="stego.png">scarica PNG</a>)</figcaption></figure>
+  <figure><canvas id="cOut"></canvas><figcaption>Segreta estratta</figcaption></figure>
+</div>
+
+<script>
+/**
+ * Steganografia immagine-in-immagine (LSB a k bit, con chiave opzionale).
+ *
+ * Lavora su oggetti tipo ImageData: { data: Uint8ClampedArray RGBA, width, height }
+ * quindi funziona nel browser (canvas.getContext('2d').getImageData) e in Node.
+ *
+ * Idea:
+ *  - si tengono gli (8-k) bit alti di ogni canale della cover
+ *  - nei k bit bassi si scrivono i k bit alti della segreta
+ *  - con una chiave, i pixel della segreta vengono prima permutati
+ *    (Fisher-Yates con PRNG inizializzato da SHA-256 della chiave):
+ *    senza la chiave giusta si estrae solo rumore.
+ *
+ * NB: salvare sempre in PNG. Il JPEG distrugge i bit bassi.
+ */
+
+async function seedFromKey(key) {
+  const bytes = new TextEncoder().encode(key);
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return (hash[0] << 24 | hash[1] << 16 | hash[2] << 8 | hash[3]) >>> 0;
+}
+
+// PRNG deterministico (mulberry32)
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+async function permutation(n, key) {
+  const rand = mulberry32(await seedFromKey(key));
+  const p = new Uint32Array(n);
+  for (let i = 0; i < n; i++) p[i] = i;
+  for (let i = n - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [p[i], p[j]] = [p[j], p[i]];
+  }
+  return p;
+}
+
+/**
+ * Nasconde `secret` dentro `cover`. Le due immagini devono avere le stesse
+ * dimensioni (nel browser ridimensiona prima la segreta con un canvas).
+ * Ritorna un nuovo oggetto { data, width, height }.
+ */
+async function embed(cover, secret, { bits = 4, key = null } = {}) {
+  if (bits < 1 || bits > 7) throw new Error("bits deve essere tra 1 e 7");
+  if (cover.width !== secret.width || cover.height !== secret.height)
+    throw new Error("cover e segreta devono avere le stesse dimensioni");
+
+  const n = cover.width * cover.height;
+  const perm = key ? await permutation(n, key) : null;
+  const highMask = (0xff << bits) & 0xff; // es. 11110000
+  const shift = 8 - bits;
+  const out = new Uint8ClampedArray(cover.data.length);
+
+  for (let i = 0; i < n; i++) {
+    const s = (perm ? perm[i] : i) * 4; // pixel della segreta da mettere qui
+    const c = i * 4;
+    for (let ch = 0; ch < 3; ch++) {
+      out[c + ch] = (cover.data[c + ch] & highMask) | (secret.data[s + ch] >> shift);
+    }
+    out[c + 3] = 255; // alpha opaco: un alpha < 255 può alterare i bit al salvataggio
+  }
+  return { data: out, width: cover.width, height: cover.height };
+}
+
+/** Estrae l'immagine nascosta. Stessi `bits` e `key` usati in embed. */
+async function extract(stego, { bits = 4, key = null } = {}) {
+  const n = stego.width * stego.height;
+  const perm = key ? await permutation(n, key) : null;
+  const lowMask = (1 << bits) - 1;           // es. 00001111
+  const shift = 8 - bits;
+  const center = 1 << (shift - 1);           // centra nell'intervallo di quantizzazione
+  const out = new Uint8ClampedArray(stego.data.length);
+
+  for (let i = 0; i < n; i++) {
+    const c = i * 4;
+    const s = (perm ? perm[i] : i) * 4;      // rimette il pixel al suo posto
+    for (let ch = 0; ch < 3; ch++) {
+      out[s + ch] = ((stego.data[c + ch] & lowMask) << shift) | center;
+    }
+    out[s + 3] = 255;
+  }
+  return { data: out, width: stego.width, height: stego.height };
+}
+
+/** PSNR in dB tra due immagini delle stesse dimensioni (solo RGB). */
+function psnr(a, b) {
+  let mse = 0, count = 0;
+  for (let i = 0; i < a.data.length; i += 4) {
+    for (let ch = 0; ch < 3; ch++) {
+      const d = a.data[i + ch] - b.data[i + ch];
+      mse += d * d; count++;
+    }
+  }
+  mse /= count;
+  return mse === 0 ? Infinity : 10 * Math.log10((255 * 255) / mse);
+}
+
+// ---------- interfaccia ----------
+
+const $ = (id) => document.getElementById(id);
+
+function loadImage(file) {
+  return new Promise((res, rej) => {
+    const img = new Image();
+    img.onload = () => res(img);
+    img.onerror = rej;
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+// Disegna l'immagine su un canvas w×h e ne restituisce l'ImageData
+function toImageData(img, w = img.naturalWidth, h = img.naturalHeight) {
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const ctx = c.getContext("2d");
+  ctx.drawImage(img, 0, 0, w, h);
+  return ctx.getImageData(0, 0, w, h);
+}
+
+function show(canvas, { data, width, height }) {
+  canvas.width = width; canvas.height = height;
+  canvas.getContext("2d").putImageData(new ImageData(data, width, height), 0, 0);
+}
+
+const status = (msg, err = false) => { $("status").textContent = msg; $("status").style.color = err ? "#b00" : "#070"; };
+window.addEventListener("error", (e) => status("Errore: " + e.message, true));
+window.addEventListener("unhandledrejection", (e) => status("Errore: " + (e.reason?.message || e.reason), true));
+
+const opts = () => ({ bits: +$("bits").value, key: $("key").value || null });
+
+$("go").onclick = async () => {
+  if (!$("cover").files[0] || !$("secret").files[0]) return status("Scegli sia la cover sia la segreta", true);
+  status("Elaborazione in corso…");
+  const coverImg = await loadImage($("cover").files[0]);
+  const cover = toImageData(coverImg);
+  const secret = toImageData(await loadImage($("secret").files[0]), cover.width, cover.height);
+
+  const stego = await embed(cover, secret, opts());
+  const out = await extract(stego, opts());
+
+  show($("cCover"), cover); show($("cStego"), stego); show($("cOut"), out);
+  $("dl").href = $("cStego").toDataURL("image/png");
+  $("info").textContent =
+    `PSNR cover→stego: ${psnr(cover, stego).toFixed(2)} dB · ` +
+    `PSNR segreta→estratta: ${psnr(secret, out).toFixed(2)} dB`;
+  status(`Fatto: immagine stego creata (${stego.width}×${stego.height}). Usa "scarica PNG" per salvarla.`);
+};
+
+$("ex").onclick = async () => {
+  if (!$("stegoIn").files[0]) return status("Scegli una PNG stego", true);
+  const stego = toImageData(await loadImage($("stegoIn").files[0]));
+  show($("cStego"), stego);
+  show($("cOut"), await extract(stego, opts()));
+  status("Fatto: immagine segreta estratta.");
+};
+</script>
+</body>
+</html>

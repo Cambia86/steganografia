@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<title>Steganografia senza perdita — file dentro immagine</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 1000px; margin: 2rem auto; padding: 0 1rem; line-height: 1.4; }
+  fieldset { border: 1px solid #ccc; border-radius: 8px; margin: 1rem 0; padding: 1rem; }
+  legend { font-weight: 600; }
+  .row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: end; margin: .5rem 0; }
+  figure { margin: 0; } canvas, img.prev { max-width: 300px; max-height: 300px; border: 1px solid #ccc; display: block; }
+  figcaption { font-size: .85rem; color: #555; }
+  .status { font-weight: 600; } .ok { color: #070; } .err { color: #b00; }
+  code { background: #f3f3f3; padding: 0 .25rem; border-radius: 3px; font-size: .85em; word-break: break-all; }
+</style>
+</head>
+<body>
+<h1>Nascondi un file (anche una foto) senza perdere qualità</h1>
+<p>Il file segreto viene inserito byte per byte nei bit meno significativi della cover.
+All'estrazione si ottiene il <b>file identico all'originale</b>. Con una password viene cifrato con AES-256-GCM.</p>
+
+<fieldset>
+  <legend>1. Nascondi</legend>
+  <div class="row">
+    <label>Cover (JPG/PNG) <input type="file" id="cover" accept="image/*"></label>
+    <label>File segreto (qualsiasi) <input type="file" id="secret"></label>
+    <label>Password <input type="password" id="pwd1" placeholder="opzionale"></label>
+    <button id="go">Nascondi</button>
+  </div>
+  <p id="status1" class="status"></p>
+  <p id="info1"></p>
+  <div class="row">
+    <figure><canvas id="cCover"></canvas><figcaption>Cover</figcaption></figure>
+    <figure><canvas id="cStego"></canvas><figcaption>Stego — <a id="dl" download="stego.png" hidden>scarica PNG</a></figcaption></figure>
+  </div>
+</fieldset>
+
+<fieldset>
+  <legend>2. Estrai</legend>
+  <div class="row">
+    <label>Stego PNG <input type="file" id="stegoIn" accept="image/png"></label>
+    <label>Password <input type="password" id="pwd2" placeholder="se usata"></label>
+    <button id="ex">Estrai</button>
+  </div>
+  <p id="status2" class="status"></p>
+  <p id="info2"></p>
+  <figure id="prevBox" hidden><img id="prev" class="prev" alt=""><figcaption>File estratto — <a id="dl2">scarica</a></figcaption></figure>
+</fieldset>
+
+<script>
+// ======================= LOGICA =======================
+const MAGIC = [0x53, 0x54, 0x47, 0x32];      // "STG2"
+const HEADER = 9;                            // magic(4) + flags(1) + lunghezza(4)
+const MAX_BITS = 4;                          // oltre 4 bit la cover si degrada troppo
+
+const enc = new TextEncoder(), dec = new TextDecoder();
+
+// Byte scrivibili nei k bit bassi dei canali R,G,B (alpha escluso)
+const capacity = (w, h, k) => Math.floor((w * h * 3 * k) / 8);
+
+/** Scrive `bytes` nei k bit bassi di data (RGBA), in sequenza, saltando l'alpha. */
+function writeBits(data, bytes, k) {
+  const mask = (1 << k) - 1, keep = 0xff ^ mask;
+  let acc = 0, accBits = 0, bi = 0;
+  for (let i = 0; i < data.length && (bi < bytes.length || accBits > 0); i++) {
+    if ((i & 3) === 3) continue;                    // salta alpha
+    while (accBits < k && bi < bytes.length) { acc = (acc << 8) | bytes[bi++]; accBits += 8; }
+    let chunk;
+    if (accBits >= k) { chunk = (acc >> (accBits - k)) & mask; accBits -= k; }
+    else { chunk = (acc << (k - accBits)) & mask; accBits = 0; }   // padding finale
+    acc &= (1 << accBits) - 1;
+    data[i] = (data[i] & keep) | chunk;
+  }
+}
+
+/** Legge n byte dai k bit bassi di data (RGBA). */
+function readBytes(data, k, n) {
+  const out = new Uint8Array(n), mask = (1 << k) - 1;
+  let acc = 0, accBits = 0, oi = 0;
+  for (let i = 0; i < data.length && oi < n; i++) {
+    if ((i & 3) === 3) continue;
+    acc = (acc << k) | (data[i] & mask); accBits += k;
+    if (accBits >= 8) { out[oi++] = (acc >> (accBits - 8)) & 0xff; accBits -= 8; acc &= (1 << accBits) - 1; }
+  }
+  if (oi < n) throw new Error("Dati incompleti: l'immagine non contiene un payload valido");
+  return out;
+}
+
+function concat(...parts) {
+  const out = new Uint8Array(parts.reduce((s, p) => s + p.length, 0));
+  let o = 0; for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+const u32 = (n) => new Uint8Array([n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
+const readU32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+
+// Contenuto: [lenNome u16][nome][lenMime u8][mime][byte del file]
+function packFile(name, mime, bytes) {
+  const n = enc.encode(name).slice(0, 65535), m = enc.encode(mime || "application/octet-stream").slice(0, 255);
+  return concat(new Uint8Array([n.length >> 8, n.length & 255]), n, new Uint8Array([m.length]), m, bytes);
+}
+function unpackFile(b) {
+  const nl = (b[0] << 8) | b[1]; const name = dec.decode(b.subarray(2, 2 + nl));
+  const ml = b[2 + nl]; const mime = dec.decode(b.subarray(3 + nl, 3 + nl + ml));
+  return { name, mime, bytes: b.slice(3 + nl + ml) };
+}
+
+// --- Cifratura: PBKDF2 (SHA-256, 200k iterazioni) -> AES-256-GCM ---
+async function deriveKey(password, salt) {
+  const base = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: 200000, hash: "SHA-256" },
+    base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+}
+async function encrypt(plain, password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await deriveKey(password, salt), plain));
+  return concat(salt, iv, ct);
+}
+async function decrypt(body, password) {
+  const salt = body.subarray(0, 16), iv = body.subarray(16, 28), ct = body.subarray(28);
+  try { return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, await deriveKey(password, salt), ct)); }
+  catch { throw new Error("Password errata (o dati corrotti)"); }
+}
+
+/** Nasconde un file nella cover. Sceglie il minimo numero di bit sufficiente. */
+async function embedFile(cover, file, password) {
+  let body = packFile(file.name, file.type, file.bytes);
+  if (password) body = await encrypt(body, password);
+  const payload = concat(new Uint8Array(MAGIC), new Uint8Array([password ? 1 : 0]), u32(body.length), body);
+
+  let k = 1;
+  while (k <= MAX_BITS && capacity(cover.width, cover.height, k) < payload.length) k++;
+  if (k > MAX_BITS) {
+    const cap = capacity(cover.width, cover.height, MAX_BITS);
+    throw new Error(`File troppo grande: servono ${fmt(payload.length)}, la cover ne contiene al massimo ${fmt(cap)}. Usa una cover più grande o comprimi il file.`);
+  }
+  const data = new Uint8ClampedArray(cover.data);
+  for (let i = 3; i < data.length; i += 4) data[i] = 255;   // alpha opaco
+  writeBits(data, payload, k);
+  return { stego: { data, width: cover.width, height: cover.height }, bits: k,
+           used: payload.length / capacity(cover.width, cover.height, k) };
+}
+
+/** Estrae il file: prova k = 1..8 finché trova l'intestazione "STG2". */
+async function extractFile(stego, password) {
+  for (let k = 1; k <= 8; k++) {
+    const h = readBytes(stego.data, k, HEADER);
+    if (!MAGIC.every((v, i) => h[i] === v)) continue;
+    const encrypted = h[4] === 1, len = readU32(h, 5);
+    if (HEADER + len > capacity(stego.width, stego.height, k)) continue;
+    let body = readBytes(stego.data, k, HEADER + len).subarray(HEADER);
+    if (encrypted) {
+      if (!password) throw new Error("Il contenuto è cifrato: inserisci la password");
+      body = await decrypt(body, password);
+    }
+    return { ...unpackFile(body), bits: k, encrypted };
+  }
+  throw new Error("Nessun contenuto nascosto trovato (l'immagine è stata ricompressa o non è una stego)");
+}
+
+function psnr(a, b) {
+  let mse = 0, c = 0;
+  for (let i = 0; i < a.data.length; i += 4) for (let ch = 0; ch < 3; ch++) { const d = a.data[i + ch] - b.data[i + ch]; mse += d * d; c++; }
+  mse /= c; return mse === 0 ? Infinity : 10 * Math.log10(65025 / mse);
+}
+async function sha256(bytes) {
+  return [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+function fmt(n) { return n > 1048576 ? (n / 1048576).toFixed(2) + " MB" : n > 1024 ? (n / 1024).toFixed(1) + " KB" : n + " B"; }
+
+// ======================= INTERFACCIA =======================
+const $ = (id) => document.getElementById(id);
+const setStatus = (el, msg, err = false) => { $(el).textContent = msg; $(el).className = "status " + (err ? "err" : "ok"); };
+
+async function readImage(file) {
+  // niente conversioni di colore o premoltiplicazione: i bit devono restare intatti
+  const bmp = await createImageBitmap(file, { colorSpaceConversion: "none", premultiplyAlpha: "none" });
+  const c = document.createElement("canvas"); c.width = bmp.width; c.height = bmp.height;
+  const ctx = c.getContext("2d"); ctx.drawImage(bmp, 0, 0);
+  return ctx.getImageData(0, 0, c.width, c.height);
+}
+function show(canvas, img) {
+  canvas.width = img.width; canvas.height = img.height;
+  canvas.getContext("2d").putImageData(new ImageData(img.data, img.width, img.height), 0, 0);
+}
+
+$("go").onclick = async () => {
+  try {
+    const cf = $("cover").files[0], sf = $("secret").files[0];
+    if (!cf || !sf) return setStatus("status1", "Scegli sia la cover sia il file segreto", true);
+    setStatus("status1", "Elaborazione in corso…"); $("info1").textContent = ""; $("dl").hidden = true;
+
+    let cover;
+    try { cover = await readImage(cf); }
+    catch { throw new Error("Il browser non riesce a leggere la cover (se è HEIC, convertila in JPG)"); }
+    const bytes = new Uint8Array(await sf.arrayBuffer());
+    const { stego, bits, used } = await embedFile(cover, { name: sf.name, type: sf.type, bytes }, $("pwd1").value);
+
+    show($("cCover"), cover); show($("cStego"), stego);
+    const blob = await new Promise(r => $("cStego").toBlob(r, "image/png"));
+    $("dl").href = URL.createObjectURL(blob); $("dl").hidden = false;
+
+    $("info1").innerHTML =
+      `File nascosto: <b>${sf.name}</b> (${fmt(bytes.length)}) · bit usati per canale: <b>${bits}</b> · ` +
+      `capacità occupata: ${(used * 100).toFixed(1)}% · PSNR cover→stego: <b>${psnr(cover, stego).toFixed(2)} dB</b> · ` +
+      `PNG: ${fmt(blob.size)}<br>SHA-256 originale: <code>${await sha256(bytes)}</code>`;
+    setStatus("status1", "Fatto: immagine stego creata. Scaricala con il link (inviala come file, non come foto).");
+  } catch (e) { setStatus("status1", "Errore: " + e.message, true); }
+};
+
+$("ex").onclick = async () => {
+  try {
+    const f = $("stegoIn").files[0];
+    if (!f) return setStatus("status2", "Scegli una PNG stego", true);
+    setStatus("status2", "Estrazione in corso…"); $("info2").textContent = ""; $("prevBox").hidden = true;
+
+    const out = await extractFile(await readImage(f), $("pwd2").value);
+    const url = URL.createObjectURL(new Blob([out.bytes], { type: out.mime }));
+    $("dl2").href = url; $("dl2").download = out.name; $("dl2").textContent = "scarica " + out.name;
+    $("prev").src = out.mime.startsWith("image/") ? url : ""; $("prevBox").hidden = false;
+
+    $("info2").innerHTML =
+      `File: <b>${out.name}</b> (${fmt(out.bytes.length)}, ${out.mime}) · bit: ${out.bits} · ` +
+      `cifrato: ${out.encrypted ? "sì" : "no"}<br>SHA-256 estratto: <code>${await sha256(out.bytes)}</code>`;
+    setStatus("status2", "Fatto: file estratto. Confronta lo SHA-256 con quello dell'originale.");
+  } catch (e) { setStatus("status2", "Errore: " + e.message, true); }
+};
+</script>
+</body>
+</html>
